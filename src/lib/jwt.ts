@@ -1,4 +1,5 @@
 import { sign, verify, JwtPayload } from 'jsonwebtoken';
+import { randomUUID } from 'crypto';
 import { prisma } from '../prisma/client';
 
 // In production, these should be stored in environment variables
@@ -32,7 +33,11 @@ export const generateAccessToken = (userId: string) => {
 
 export const generateRefreshToken = (userId: string) => {
   return sign(
-    { userId, type: 'refresh' },
+    { 
+      userId, 
+      type: 'refresh', 
+      nonce: randomUUID()  // Adds uniqueness to prevent duplicate token errors
+    },
     getPrivateKey(),
     {
       algorithm: 'RS256',

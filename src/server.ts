@@ -1,6 +1,9 @@
 import fastify from 'fastify';
 import { prisma } from './prisma/client';
 import dotenv from 'dotenv';
+import rateLimit from '@fastify/rate-limit';
+import helmet from '@fastify/helmet';
+import cors from '@fastify/cors';
 import { 
   register, 
   login, 
@@ -11,19 +14,38 @@ import {
   resetPassword,
   verifyAccessToken,
 } from './routes/auth';
+import { getLicenseVerify, getLicensePlans } from './routes/license';
 import './types';
 
+// Log current working directory for debugging
+console.log('Current working directory:', process.cwd());
+
 // Load environment variables
-dotenv.config();
 
 const server = fastify({
   logger: true,
 });
 
+// Register middleware
+server.register(rateLimit, {
+  max: 100,
+  timeWindow: '1 minute',
+  // Exclude auth routes from strict rate limiting initially
+  // We'll add more specific limits per route if needed
+});
+server.register(helmet);
+server.register(cors, {
+  origin: '*', // In production, restrict to your frontend domains
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  credentials: true,
+});
+
 // Middleware to verify access token
 server.addHook('preHandler', async (request, reply) => {
-  // Skip auth for auth routes and health
-  if (request.routeOptions.url?.startsWith('/auth') || request.url === '/health') {
+  // Skip auth for auth routes, health, and public license routes
+  if (request.routeOptions.url?.startsWith('/auth') || 
+      request.url === '/health' ||
+      request.url === '/license/plans') {
     return;
   }
   const authHeader = request.headers.authorization;
@@ -47,14 +69,22 @@ server.get('/health', async (request, reply) => {
 
 // Register auth routes
 server.register(async (instance) => {
-  instance.post('/auth/register', register);
-  instance.post('/auth/login', login);
-  instance.post('/auth/refresh', refresh);
-  instance.post('/auth/logout', logout);
-  instance.post('/auth/verify-email', verifyEmail);
-  instance.post('/auth/forgot-password', forgotPassword);
-  instance.post('/auth/reset-password', resetPassword);
+  instance.post('/register', register);
+  instance.post('/login', login);
+  instance.post('/refresh', refresh);
+  instance.post('/logout', logout);
+  instance.post('/verify-email', verifyEmail);
+  instance.post('/forgot-password', forgotPassword);
+  instance.post('/reset-password', resetPassword);
 }, { prefix: '/auth' });
+
+// Register license routes
+server.register((instance) => {
+  console.log('Registering license routes');
+  instance.get('/verify', getLicenseVerify);
+  instance.get('/plans', getLicensePlans);
+  console.log('License routes registered');
+}, { prefix: '/license' });
 
 const start = async () => {
   try {
