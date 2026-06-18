@@ -3,18 +3,58 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider = "sqlite"
 }
 
 model User {
-  id        String   @id @default(uuid())
-  email     String   @unique
-  name      String?
-  password  String
-  role      String   @default("user")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id               String         @id @default(cuid())
+  email            String         @unique
+  name             String?
+  passwordHash     String
+  emailVerified    Boolean        @default(false)
+  emailVerifyToken String?
+  language         String         @default("es")
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  license          License?
+  refreshTokens    RefreshToken[]
+}
 
-  @@index([email])
+model License {
+  id                   String        @id @default(cuid())
+  userId               String        @unique
+  plan                 Plan          @default(FREE)
+  accountLimit         Int           @default(5)
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  status               LicenseStatus @default(ACTIVE)
+  currentPeriodEnd     DateTime?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+  user                 User          @relation(fields: [userId], references: [id])
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  used      Boolean  @default(false)
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+enum Plan {
+  FREE
+  STARTER
+  PRO
+  BUSINESS
+  ENTERPRISE
+}
+
+enum LicenseStatus {
+  ACTIVE
+  CANCELLED
+  PAST_DUE
+  UNPAID
 }
