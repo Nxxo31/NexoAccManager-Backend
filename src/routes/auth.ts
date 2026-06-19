@@ -11,6 +11,7 @@ import {
   useRefreshToken,
   findRefreshToken,
 } from '../lib/jwt';
+import { sendVerificationEmail, sendPasswordResetEmail, verifyEmailToken } from '../lib/email';
 
 export { verifyAccessToken, verifyRefreshToken };
 
@@ -42,6 +43,11 @@ export async function register(request: FastifyRequest, reply: FastifyReply) {
       plan: 'FREE',
       accountLimit: 5,
     },
+  });
+
+  // Send email verification (non-blocking — don't fail registration if email fails)
+  sendVerificationEmail(user.id, email).catch((err) => {
+    console.error('[Auth] Failed to send verification email:', err);
   });
 
   const accessToken = generateAccessToken(user.id);
@@ -144,18 +150,108 @@ export async function logout(request: FastifyRequest, reply: FastifyReply) {
   reply.send({ success: true });
 }
 
-// Stub endpoints for email verification and password reset
+// POST /auth/verify-email — verify email from token in URL
 export async function verifyEmail(request: FastifyRequest, reply: FastifyReply) {
-  // TODO: implement email verification token verification
-  reply.send({ success: true, message: 'Email verified (stub)' });
+  const { token } = request.body as { token: string };
+
+  if (!token) {
+    return reply.status(400).send({ error: 'Token is required' });
+  }
+
+  let payload;
+  try {
+    payload = verifyEmailToken(token);
+  } catch {
+    return reply.status(400).send({ error: 'Invalid or expired token' });
+  }
+
+  if (payload.purpose !== 'verify') {
+    return reply.status(400).send({ error: 'Token is not an email verification token' });
+  }
+
+  const user = await prisma.user.findUnique({ where: { id: payload.userId } });
+  if (!user) {
+    return reply.status(404).send({ error: 'User not found' });
+  }
+
+  if (user.emailVerified) {
+    return reply.send({ success: true, message: 'Email already verified' });
+  }
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { emailVerified: true, emailVerifyToken: null },
+  });
+
+  return reply.send({ success: true, message: 'Email verified successfully' });
 }
 
+// POST /auth/forgot-password — send password reset email
 export async function forgotPassword(request: FastifyRequest, reply: FastifyReply) {
-  // TODO: implement forgot password flow
-  reply.send({ success: true, message: 'Password reset email sent (stub)' });
+  const { email } = request.body as { email: string };
+
+  if (!email) {
+    return reply.status(400).send({ error: 'Email is required' });
+  }
+
+  const user = await prisma.user.findUnique({ where: { email } });
+  
+  // Always return 200 to prevent email enumeration attacks
+  if (!user) {
+    console.log(`[Auth] Forgot password for non-existent email: ${email}`);
+    return reply.send({ success: true, message: 'If the email exists, a reset link has been sent' });
+  }
+
+  // Send reset email (non-blocking)
+  sendPasswordResetEmail(user.id, email).catch((err) => {
+    console.error('[Auth] Failed to send password reset email:', err);
+  });
+
+  return reply.send({ success: true, message: 'If the email exists, a reset link has been sent' });
 }
 
+// POST /auth/reset-password — reset password using token from email
 export async function resetPassword(request: FastifyRequest, reply: FastifyReply) {
-  // TODO: implement reset password with token
-  reply.send({ success: true, message: 'Password reset (stub)' });
+  const { token, newPassword } = request.body as { token: string; newPassword: string };
+
+  if (!token || !newPassword) {
+    return reply.status(400).send({ error: 'Token and new password are required' });
+  }
+
+  if (newPassword.length < 8) {
+    return reply.status(400).send({ error: 'Password must be at least 8 characters' });
+  }
+
+  let payload;
+  try {
+    payload = verifyEmailToken(token);
+  } catch {
+    return reply.status(400).send({ error: 'Invalid or expired token' });
+  }
+
+  if (payload.purpose !== 'reset') {
+    return reply.status(400).send({ error: 'Token is not a password reset token' });
+  }
+
+  const user = await prisma.user.findUnique({ where: { id: payload.userId } });
+  if (!user) {
+    return reply.status(404).send({ error: 'User not found' });
+  }
+
+  // Check password is not the same
+  const samePassword = await comparePassword(newPassword, user.passwordHash);
+  if (samePassword) {
+    return reply.status(400).send({ error: 'New password must be different from current password' });
+  }
+
+  const newHash = await hashPassword(newPassword);
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { passwordHash: newHash, emailVerifyToken: null },
+  });
+
+  // Invalidate all existing refresh tokens (security: user may have been compromised)
+  await prisma.refreshToken.deleteMany({ where: { userId: user.id } });
+
+  return reply.send({ success: true, message: 'Password reset successfully. Please login again.' });
 }

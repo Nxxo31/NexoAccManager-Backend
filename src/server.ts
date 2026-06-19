@@ -1,4 +1,4 @@
-import fastify from 'fastify';
+import fastify, { FastifyInstance } from 'fastify';
 import { prisma } from './prisma/client';
 import dotenv from 'dotenv';
 import rateLimit from '@fastify/rate-limit';
@@ -15,81 +15,188 @@ import {
   verifyAccessToken,
 } from './routes/auth';
 import { getLicenseVerify, getLicensePlans } from './routes/license';
+import {
+  createCheckoutSession,
+  stripeWebhook,
+  getStripePlans,
+  createPortalSession,
+} from './routes/stripe';
 import './types';
 
-// Log current working directory for debugging
-console.log('Current working directory:', process.cwd());
-
 // Load environment variables
+dotenv.config();
 
-const server = fastify({
+// ─── Shared raw body cache for Stripe webhook signature verification ────────
+// Keyed by request ID so concurrent requests don't collide
+const rawBodyCache = new Map<string, Buffer>();
+
+// ─── Type augmentation for raw body access in route handlers ──────────────
+declare module 'fastify' {
+  interface FastifyRequest {
+    rawBody?: Buffer;
+  }
+}
+
+// ─── Validate required environment variables ───────────────────────────────
+const requiredEnv = ['JWT_PRIVATE_KEY', 'JWT_PUBLIC_KEY', 'JWT_SECRET'];
+for (const env of requiredEnv) {
+  if (!process.env[env]) {
+    console.error(`Missing required environment variable: ${env}`);
+    process.exit(1);
+  }
+}
+
+// ─── Create Fastify instance ───────────────────────────────────────────────
+const server: FastifyInstance = fastify({
   logger: true,
+  bodyLimit: 1048576, // 1MB — needed for Stripe webhook payloads
 });
 
-// Register middleware
-server.register(rateLimit, {
-  max: 100,
-  timeWindow: '1 minute',
-  // Exclude auth routes from strict rate limiting initially
-  // We'll add more specific limits per route if needed
-});
-server.register(helmet);
+// ─── Configure CORS ────────────────────────────────────────────────────────
+const allowedOrigins = process.env.NODE_ENV === 'production' 
+  ? [
+      process.env.FRONTEND_URL,
+      'https://nexoaccmanager.vercel.app',
+      'https://nexoaccmanager.com',
+    ].filter(Boolean) as string[]
+  : ['http://localhost:3000', 'http://localhost:3001'];
+
 server.register(cors, {
-  origin: '*', // In production, restrict to your frontend domains
+  origin: allowedOrigins,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   credentials: true,
 });
 
-// Middleware to verify access token
+// ─── Configure Helmet for security headers ────────────────────────────────
+server.register(helmet, {
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      connectSrc: ["'self'", 'https://*.stripe.com'],
+    },
+  },
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+  },
+});
+
+// ─── Global rate limit ────────────────────────────────────────────────────
+server.register(rateLimit, {
+  max: 100,
+  timeWindow: '1 minute',
+});
+
+// ─── Raw body caching for Stripe webhook ──────────────────────────────────
+// Stripe requires the raw (unparsed) body to verify webhook signatures.
+// Cache the raw body on onRequest, then make it available in the handler.
+server.addHook('onRequest', async (request) => {
+  if (request.url === '/stripe/webhook') {
+    // In Fastify, the raw body is available on the Node.js IncomingMessage
+    const chunks: Buffer[] = [];
+    for await (const chunk of request.raw) {
+      chunks.push(Buffer.from(chunk));
+    }
+    const rawBody = Buffer.concat(chunks);
+    rawBodyCache.set(request.id, rawBody);
+    // Reconstruct body for Fastify's JSON parsing by storing it back
+    (request as any).rawBody = rawBody;
+  }
+});
+
+server.addHook('preHandler', async (request) => {
+  // Attach cached raw body to request for stripeWebhook handler
+  (request as any).rawBody = rawBodyCache.get(request.id);
+});
+
+// ─── Auth-specific rate limits ────────────────────────────────────────────
+const authRateLimit = {
+  login: { max: 5, timeWindow: '15 minutes' },
+  register: { max: 3, timeWindow: '1 hour' },
+  forgotPassword: { max: 3, timeWindow: '1 hour' },
+};
+
+// Helper: create a rate-limit preHandler for specific options
+function createRateLimitPreHandler(options: { max: number; timeWindow: string }) {
+  return async (request: any, reply: any) => {
+    const rl = (request.server as any)['@fastify/rate-limit'];
+    if (rl?.rateLimitPreHandler) {
+      const originalMax = (rl as any).global['max'];
+      const originalTimeWindow = (rl as any).global['timeWindow'];
+      (rl as any).global['max'] = options.max;
+      (rl as any).global['timeWindow'] = options.timeWindow;
+      try {
+        await rl.rateLimitPreHandler(request, reply);
+      } finally {
+        (rl as any).global['max'] = originalMax;
+        (rl as any).global['timeWindow'] = originalTimeWindow;
+      }
+    }
+  };
+}
+
+// ─── Auth middleware ───────────────────────────────────────────────────────
 server.addHook('preHandler', async (request, reply) => {
-  // Skip auth for auth routes, health, and public license routes
-  if (request.routeOptions.url?.startsWith('/auth') || 
-      request.url === '/health' ||
-      request.url === '/license/plans') {
+  const publicRoutes = [
+    /^\/auth/,
+    /^\/health/,
+    /^\/license\/plans/,
+    /^\/stripe\/webhook/,
+    /^\/stripe\/plans/,
+  ];
+  if (publicRoutes.some((re) => re.test(request.routeOptions.url ?? ''))) {
     return;
   }
+  
   const authHeader = request.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
     return reply.status(401).send({ error: 'Missing or invalid authorization header' });
   }
+  
   const token = authHeader.slice(7);
   try {
     const payload = verifyAccessToken(token);
-    // Attach userId to request for use in handlers
-    request.userId = payload.userId;
-  } catch (err) {
+    (request as any).userId = payload.userId;
+  } catch {
     return reply.status(401).send({ error: 'Invalid or expired token' });
   }
 });
 
-// Health check
-server.get('/health', async (request, reply) => {
-  return { status: 'ok' };
-});
+// ─── Health check ──────────────────────────────────────────────────────────
+server.get('/health', async () => ({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// Register auth routes
+// ─── Auth routes ───────────────────────────────────────────────────────────
 server.register(async (instance) => {
-  instance.post('/register', register);
-  instance.post('/login', login);
+  instance.post('/register', { preHandler: [createRateLimitPreHandler(authRateLimit.register)] }, register);
+  instance.post('/login', { preHandler: [createRateLimitPreHandler(authRateLimit.login)] }, login);
   instance.post('/refresh', refresh);
   instance.post('/logout', logout);
   instance.post('/verify-email', verifyEmail);
-  instance.post('/forgot-password', forgotPassword);
+  instance.post('/forgot-password', { preHandler: [createRateLimitPreHandler(authRateLimit.forgotPassword)] }, forgotPassword);
   instance.post('/reset-password', resetPassword);
 }, { prefix: '/auth' });
 
-// Register license routes
+// ─── License routes ────────────────────────────────────────────────────────
 server.register((instance) => {
-  console.log('Registering license routes');
   instance.get('/verify', getLicenseVerify);
   instance.get('/plans', getLicensePlans);
-  console.log('License routes registered');
 }, { prefix: '/license' });
 
+// ─── Stripe routes ─────────────────────────────────────────────────────────
+server.register(async (instance) => {
+  instance.get('/plans', getStripePlans);                         // public
+  instance.post('/webhook', stripeWebhook);                       // raw body, no auth
+  instance.post('/checkout/create-session', createCheckoutSession); // auth required
+  instance.post('/portal', createPortalSession);                  // auth required
+}, { prefix: '/stripe' });
+
+// ─── Start server ──────────────────────────────────────────────────────────
 const start = async () => {
   try {
-    await server.listen({ port: 3000, host: '0.0.0.0' });
-    server.log.info(`Server listening on ${server.server.address()}`);
+    const port = parseInt(process.env.PORT || '3000');
+    await server.listen({ port, host: '0.0.0.0' });
+    server.log.info(`Server listening on port ${port}`);
   } catch (err) {
     server.log.error(err);
     process.exit(1);
@@ -98,5 +205,4 @@ const start = async () => {
 
 start();
 
-// Export for testing
 export { server };
