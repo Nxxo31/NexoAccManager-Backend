@@ -12,6 +12,7 @@ import {
   findRefreshToken,
 } from '../lib/jwt';
 import { sendVerificationEmail, sendPasswordResetEmail, verifyEmailToken } from '../lib/email';
+import { PLANS } from './license';
 
 export { verifyAccessToken, verifyRefreshToken };
 
@@ -148,6 +149,81 @@ export async function logout(request: FastifyRequest, reply: FastifyReply) {
   }
 
   reply.send({ success: true });
+}
+
+// GET /auth/me — returns current user profile with license
+export async function getMe(request: FastifyRequest, reply: FastifyReply) {
+  const userId = (request as any).userId;
+  if (!userId) {
+    return reply.status(401).send({ error: 'Not authenticated' });
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: {
+      id: true,
+      email: true,
+      name: true,
+      emailVerified: true,
+      language: true,
+      createdAt: true,
+      license: {
+        select: {
+          plan: true,
+          accountLimit: true,
+          status: true,
+          currentPeriodEnd: true,
+          stripeCustomerId: true,
+          stripeSubscriptionId: true,
+        },
+      },
+    },
+  });
+
+  if (!user) {
+    return reply.status(404).send({ error: 'User not found' });
+  }
+
+  const plan = PLANS.find((p) => p.id === (user.license?.plan ?? 'FREE'));
+
+  return reply.send({
+    ...user,
+    planDetails: plan || null,
+  });
+}
+
+// PATCH /auth/me — update user preferences (language, name)
+export async function updateMe(request: FastifyRequest, reply: FastifyReply) {
+  const userId = (request as any).userId;
+  if (!userId) {
+    return reply.status(401).send({ error: 'Not authenticated' });
+  }
+
+  const { language, name } = request.body as { language?: string; name?: string };
+
+  const updateData: { language?: string; name?: string } = {};
+  if (language !== undefined) {
+    const valid = ['es', 'en', 'pt'];
+    if (!valid.includes(language)) {
+      return reply.status(400).send({ error: 'Invalid language. Must be: es, en, or pt' });
+    }
+    updateData.language = language;
+  }
+  if (name !== undefined) {
+    updateData.name = name;
+  }
+
+  if (Object.keys(updateData).length === 0) {
+    return reply.status(400).send({ error: 'No fields to update' });
+  }
+
+  const updated = await prisma.user.update({
+    where: { id: userId },
+    data: updateData,
+    select: { id: true, email: true, name: true, language: true },
+  });
+
+  return reply.send(updated);
 }
 
 // POST /auth/verify-email — verify email from token in URL

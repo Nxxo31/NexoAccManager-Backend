@@ -13,6 +13,8 @@ import {
   forgotPassword, 
   resetPassword,
   verifyAccessToken,
+  getMe,
+  updateMe,
 } from './routes/auth';
 import { getLicenseVerify, getLicensePlans } from './routes/license';
 import {
@@ -175,6 +177,8 @@ server.register(async (instance) => {
   instance.post('/verify-email', verifyEmail);
   instance.post('/forgot-password', { preHandler: [createRateLimitPreHandler(authRateLimit.forgotPassword)] }, forgotPassword);
   instance.post('/reset-password', resetPassword);
+  instance.get('/me', getMe);
+  instance.patch('/me', updateMe);
 }, { prefix: '/auth' });
 
 // ─── License routes ────────────────────────────────────────────────────────
