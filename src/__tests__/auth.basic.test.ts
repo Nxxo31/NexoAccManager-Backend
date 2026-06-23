@@ -8,6 +8,13 @@ describe('Auth API - Basic Setup', () => {
   let app: any;
   let testPort: number;
 
+  beforeEach(async () => {
+    // Clean database before each test to prevent pollution between tests
+    await prisma.refreshToken.deleteMany();
+    await prisma.license.deleteMany();
+    await prisma.user.deleteMany();
+  });
+
   beforeAll(async () => {
     // Create fresh fastify instance for testing
     app = fastify();
@@ -45,7 +52,7 @@ describe('Auth API - Basic Setup', () => {
     await app.close();
   });
 
-  const fetch = async (endpoint: string, options: RequestInit = {}) => {
+  const apiFetch = async (endpoint: string, options: RequestInit = {}) => {
     const url = `http://127.0.0.1:${testPort}${endpoint}`;
     const defaultHeaders: HeadersInit = {
       'Content-Type': 'application/json',
@@ -54,7 +61,7 @@ describe('Auth API - Basic Setup', () => {
       ? { ...defaultHeaders, ...options.headers }
       : defaultHeaders;
 
-    const response = await fetch(url, {
+    const response = await globalThis.fetch(url, {
       method: options.method ?? 'GET',
       headers,
       body: options.body ? JSON.stringify(options.body) : undefined,
@@ -79,7 +86,7 @@ describe('Auth API - Basic Setup', () => {
     });
 
     it('should register a new user and return tokens', async () => {
-      const res = await fetch('/auth/register', {
+      const res = await apiFetch('/auth/register', {
         method: 'POST',
         body: {
           email: 'test@example.com',
@@ -97,7 +104,7 @@ describe('Auth API - Basic Setup', () => {
 
     it('should fail if email already exists', async () => {
       // Register first user
-      await fetch('/auth/register', {
+      await apiFetch('/auth/register', {
         method: 'POST',
         body: {
           email: 'dup@example.com',
@@ -107,7 +114,7 @@ describe('Auth API - Basic Setup', () => {
       });
 
       // Try to register with same email
-      const res = await fetch('/auth/register', {
+      const res = await apiFetch('/auth/register', {
         method: 'POST',
         body: {
           email: 'dup@example.com',
@@ -121,7 +128,7 @@ describe('Auth API - Basic Setup', () => {
     });
 
     it('should fail validation on missing fields', async () => {
-      const res = await fetch('/auth/register', {
+      const res = await apiFetch('/auth/register', {
         method: 'POST',
         body: {
           email: 'test@example.com',
@@ -144,7 +151,7 @@ describe('Auth API - Basic Setup', () => {
 
     it('should login with valid credentials', async () => {
       // Create user first
-      await fetch('/auth/register', {
+      await apiFetch('/auth/register', {
         method: 'POST',
         body: {
           email: 'login@example.com',
@@ -154,7 +161,7 @@ describe('Auth API - Basic Setup', () => {
       });
 
       // Now login
-      const res = await fetch('/auth/login', {
+      const res = await apiFetch('/auth/login', {
         method: 'POST',
         body: {
           email: 'login@example.com',
@@ -170,7 +177,7 @@ describe('Auth API - Basic Setup', () => {
 
     it('should fail with invalid credentials', async () => {
       // Create user
-      await fetch('/auth/register', {
+      await apiFetch('/auth/register', {
         method: 'POST',
         body: {
           email: 'fail@example.com',
@@ -180,7 +187,7 @@ describe('Auth API - Basic Setup', () => {
       });
 
       // Try wrong password
-      const res = await fetch('/auth/login', {
+      const res = await apiFetch('/auth/login', {
         method: 'POST',
         body: {
           email: 'fail@example.com',
